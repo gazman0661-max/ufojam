@@ -1,6 +1,5 @@
 plugins {
     id("com.android.application")
-    id("kotlin-android")
     // Flutter Gradle Plugin, Android ve Kotlin eklentilerinden sonra uygulanmalı.
     id("dev.flutter.flutter-gradle-plugin")
 }
@@ -11,12 +10,8 @@ android {
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_11
-        targetCompatibility = JavaVersion.VERSION_11
-    }
-
-    kotlinOptions {
-        jvmTarget = JavaVersion.VERSION_11.toString()
+        sourceCompatibility = JavaVersion.VERSION_17
+        targetCompatibility = JavaVersion.VERSION_17
     }
 
     defaultConfig {
@@ -32,6 +27,12 @@ android {
             // Bilerek imza yok: release çıktısı (AAB) imzasız üretilir.
             // İmzalama bilgisayarda jarsigner ile elle yapılır (anahtar projede/CI'da tutulmaz).
         }
+    }
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
     }
 }
 
