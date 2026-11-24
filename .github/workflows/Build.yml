@@ -1,0 +1,197 @@
+name: Zip'i derle (Android APK + AAB)
+
+# Repo köküne oyun zip'ini yükle/güncelle -> otomatik derlenir.
+# Birden fazla zip varsa en son commit'lenen zip kullanılır.
+on:
+  push:
+    paths:
+      - "*.zip"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: game
+
+env:
+  # "latest" = Godot'un son kararlı sürümü (Play şu an targetSdk 36 istiyor; 4.3 bunu karşılamaz).
+  # Sabitlemek istersen: GODOT_VERSION: 4.7.2-stable
+  GODOT_VERSION: latest
+  # Eklenti zip linkini elle vermek istersen doldur; boşsa en son sürüm GitHub'dan çekilir.
+  IAPP_URL: ""
+  ANDROID_PACKAGE: ${{ vars.ANDROID_PACKAGE }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Zip'i aç
+        working-directory: ${{ github.workspace }}
+        run: |
+          BEST=""; BEST_T=0
+          for f in *.zip; do
+            [ -f "$f" ] || continue
+            t=$(git log -1 --format=%ct -- "$f")
+            t=${t:-0}
+            if [ "$t" -ge "$BEST_T" ]; then BEST="$f"; BEST_T="$t"; fi
+          done
+          [ -n "$BEST" ] || { echo "::error::Repo kökünde .zip bulunamadı."; exit 1; }
+          echo "Kullanılan zip: $BEST"
+          rm -rf "$RUNNER_TEMP/src" game
+          mkdir -p "$RUNNER_TEMP/src"
+          unzip -q "$BEST" -d "$RUNNER_TEMP/src"
+          GD=$(find "$RUNNER_TEMP/src" -name project.godot -not -path "*/addons/*" | head -1)
+          [ -n "$GD" ] || { echo "::error::Zip içinde project.godot yok."; exit 1; }
+          mv "$(dirname "$GD")" game
+          ls game
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Godot sürümünü belirle
+        run: |
+          if [ "$GODOT_VERSION" = "latest" ]; then
+            TAG=$(curl -fsSL -H "Authorization: Bearer ${{ github.token }}" \
+              https://api.github.com/repos/godotengine/godot/releases/latest | jq -r .tag_name)
+          else
+            TAG="$GODOT_VERSION"
+          fi
+          echo "Godot: $TAG"
+          echo "GODOT_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "GODOT_TPL_DIR=${TAG/-/.}" >> "$GITHUB_ENV"
+          VER="${TAG%%-*}"
+          echo "GODOT_MINOR=$(echo "$VER" | cut -d. -f1,2)" >> "$GITHUB_ENV"
+
+      - name: Godot + export şablonlarını indir
+        run: |
+          cd "$RUNNER_TEMP"
+          BASE="https://github.com/godotengine/godot/releases/download/$GODOT_TAG"
+          curl -fsSL -o godot.zip "$BASE/Godot_v${GODOT_TAG}_linux.x86_64.zip"
+          unzip -q godot.zip
+          sudo mv "Godot_v${GODOT_TAG}_linux.x86_64" /usr/local/bin/godot
+          curl -fsSL -o tpl.tpz "$BASE/Godot_v${GODOT_TAG}_export_templates.tpz"
+          mkdir -p "$HOME/.local/share/godot/export_templates/$GODOT_TPL_DIR"
+          unzip -q tpl.tpz -d tpl
+          mv tpl/templates/* "$HOME/.local/share/godot/export_templates/$GODOT_TPL_DIR/"
+          rm -rf tpl tpl.tpz godot.zip
+          godot --version
+
+      - name: Android Gradle şablonunu kur
+        run: |
+          if [ ! -d android/build ] || [ "$(cat android/.build_version 2>/dev/null)" != "$GODOT_TPL_DIR" ]; then
+            rm -rf android/build
+            mkdir -p android/build
+            unzip -q "$HOME/.local/share/godot/export_templates/$GODOT_TPL_DIR/android_source.zip" -d android/build
+            echo "$GODOT_TPL_DIR" > android/.build_version
+            touch android/build/.gdignore
+          fi
+
+      - name: Portre "zorunlu donanım" uyarısını engelle (screen.portrait -> required=false)
+        run: |
+          python3 - <<'PY'
+          import re
+          p = "android/build/AndroidManifest.xml"
+          s = open(p, encoding="utf-8").read()
+          s = re.sub(r'\s*<uses-feature[^>]*android\.hardware\.screen\.portrait[^>]*/>', '', s)
+          add = '    <uses-feature android:name="android.hardware.screen.portrait" android:required="false" />\n'
+          s = s.replace("<application", add + "    <application", 1)
+          open(p, "w", encoding="utf-8").write(s)
+          print("screen.portrait -> required=false yazıldı")
+          PY
+
+      - name: Android SDK bileşenlerini kur (sürümler Godot şablonundan okunur)
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          CFG=android/build/config.gradle
+          BT=$(grep -oP "buildTools\s*:\s*'\K[^']+" "$CFG" || true)
+          CS=$(grep -oP "compileSdk\s*:\s*\K[0-9]+" "$CFG" || true)
+          NDK=$(grep -oP "ndkVersion\s*:\s*'\K[^']+" "$CFG" || true)
+          echo "buildTools=$BT compileSdk=$CS ndk=$NDK"
+          SDKM="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKM" --licenses > /dev/null || true
+          PKGS=("platform-tools" "cmdline-tools;latest" "cmake;3.10.2.4988404")
+          [ -n "$BT" ] && PKGS+=("build-tools;$BT")
+          [ -n "$CS" ] && PKGS+=("platforms;android-$CS")
+          [ -n "$NDK" ] && PKGS+=("ndk;$NDK")
+          "$SDKM" "${PKGS[@]}"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Godot editör ayarları (SDK/JDK yolları)
+        run: |
+          mkdir -p "$HOME/.config/godot"
+          for f in "editor_settings-4.tres" "editor_settings-$GODOT_MINOR.tres"; do
+            cat > "$HOME/.config/godot/$f" <<EOF
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/android_sdk_path = "$ANDROID_HOME"
+          export/android/java_sdk_path = "$JAVA_HOME"
+          EOF
+          done
+
+      - name: Play Billing eklentisini hazırla
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 ci/prepare_iap.py
+
+      - name: Export ayarlarını hazırla
+        run: |
+          if [ ! -f export_presets.cfg ]; then
+            cp ci/export_presets.android.cfg export_presets.cfg
+          else
+            # kendi preset'in varsa: Gradle + AAB zorunlu (Billing eklentisi için)
+            sed -i 's|^gradle_build/use_gradle_build=.*|gradle_build/use_gradle_build=true|' export_presets.cfg
+            sed -i 's|^gradle_build/export_format=.*|gradle_build/export_format=1|' export_presets.cfg
+          fi
+          if [ -n "$ANDROID_PACKAGE" ]; then
+            sed -i "s|^package/unique_name=.*|package/unique_name=\"$ANDROID_PACKAGE\"|" export_presets.cfg
+          fi
+          if grep -q 'com.example' export_presets.cfg; then
+            echo "::error::Paket adı ayarlı değil. GitHub > Settings > Secrets and variables > Actions > Variables içine ANDROID_PACKAGE ekle (Play Console'daki paket adı)."
+            exit 1
+          fi
+          grep -E "^version/(code|name)=" export_presets.cfg
+
+      - name: Debug keystore üret (sadece debug APK için, release'e dokunmaz)
+        run: |
+          keytool -genkeypair -v -keystore "$RUNNER_TEMP/debug.keystore" \
+            -storepass android -keypass android -alias androiddebugkey \
+            -keyalg RSA -keysize 2048 -validity 10000 \
+            -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Asset'leri içe aktar
+        run: timeout 900 godot --headless --path . --import || true
+
+      - name: Debug APK üret (debug imzalı)
+        env:
+          GODOT_ANDROID_KEYSTORE_DEBUG_PATH: ${{ runner.temp }}/debug.keystore
+          GODOT_ANDROID_KEYSTORE_DEBUG_USER: androiddebugkey
+          GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD: android
+        run: |
+          mkdir -p build
+          sed -i 's|^package/signed=.*|package/signed=true|' export_presets.cfg
+          sed -i 's|^gradle_build/export_format=.*|gradle_build/export_format=0|' export_presets.cfg
+          godot --headless --path . --export-debug "Android" "$PWD/build/ufo_bus_jam-debug.apk"
+          test -f build/ufo_bus_jam-debug.apk || { echo "::error::APK oluşmadı, Godot loglarına bak."; exit 1; }
+
+      - name: Release AAB üret (İMZASIZ, imzayı sen atacaksın)
+        run: |
+          sed -i 's|^package/signed=.*|package/signed=false|' export_presets.cfg
+          sed -i 's|^gradle_build/export_format=.*|gradle_build/export_format=1|' export_presets.cfg
+          godot --headless --path . --export-release "Android" "$PWD/build/ufo_bus_jam-release-unsigned.aab"
+          test -f build/ufo_bus_jam-release-unsigned.aab || { echo "::error::AAB oluşmadı, Godot loglarına bak."; exit 1; }
+          ls -la build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ufo-bus-jam-android
+          path: |
+            game/build/ufo_bus_jam-debug.apk
+            game/build/ufo_bus_jam-release-unsigned.aab
