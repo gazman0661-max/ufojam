@@ -94,15 +94,25 @@ jobs:
 
       - name: Portre "zorunlu donanım" uyarısını engelle (screen.portrait -> required=false)
         run: |
+          echo "Şablondaki manifest dosyaları:"
+          find android/build -name AndroidManifest.xml | sort
           python3 - <<'PY'
-          import re
-          p = "android/build/AndroidManifest.xml"
-          s = open(p, encoding="utf-8").read()
-          s = re.sub(r'\s*<uses-feature[^>]*android\.hardware\.screen\.portrait[^>]*/>', '', s)
+          import glob, re
           add = '    <uses-feature android:name="android.hardware.screen.portrait" android:required="false" />\n'
-          s = s.replace("<application", add + "    <application", 1)
-          open(p, "w", encoding="utf-8").write(s)
-          print("screen.portrait -> required=false yazıldı")
+          done = 0
+          for p in sorted(glob.glob("android/build/**/AndroidManifest.xml", recursive=True)):
+              s = open(p, encoding="utf-8").read()
+              # sadece uygulama manifesti: <application içeren, kütüphane (lib/) olmayan
+              if "<application" not in s or "/lib/" in p:
+                  continue
+              s = re.sub(r'\s*<uses-feature[^>]*android\.hardware\.screen\.portrait[^>]*/>', '', s)
+              s = s.replace("<application", add + "    <application", 1)
+              open(p, "w", encoding="utf-8").write(s)
+              print("screen.portrait -> required=false yazıldı:", p)
+              done += 1
+          if done == 0:
+              # Kozmetik bir ayar; bulunamazsa derlemeyi durdurma.
+              print("::warning::Uygulama manifesti bulunamadı, portre uyarısı yaması atlandı.")
           PY
 
       - name: Android SDK bileşenlerini kur (sürümler Godot şablonundan okunur)
@@ -195,3 +205,4 @@ jobs:
           path: |
             game/build/ufo_bus_jam-debug.apk
             game/build/ufo_bus_jam-release-unsigned.aab
+            
